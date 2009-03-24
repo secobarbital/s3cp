@@ -1,0 +1,153 @@
+#!/usr/bin/env ruby
+
+# Copyright (c) 2009 Seggy Umboh, Coupa Software Incorporated
+# 
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+# 
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+
+# s3cp - copies all keys matching a buckup:prefix to another bucket:prefix
+#
+# Brings the ACL of the source files over, and ensures the target bucket's
+# owner has full control over the copied files.
+
+require 'enumerator'
+require 'optparse'
+require 'rubygems'
+require 'right_aws'
+
+include RightAws
+
+# parse the arguments
+options = {
+  :log_file => '/dev/null',
+  :port => 80,
+  :protocol => 'http',
+  :progress => false,
+  :threads => 1
+}
+option_parser = OptionParser.new do |opts|
+  opts.banner = "Usage: s3cp [options] SOURCE DEST"
+  
+  opts.on("-l", "--logfile=LOGFILE", "Specify the log file to use (default: none)") { |l| options[:log_file] = l }
+  opts.on("-p", "--progress", "Show progress bars") { |p| options[:progress] = true }
+  opts.on("-s", "--https", "Use https to communicate with S3") { |s| options[:port] = 443; options[:protocol] = 'https' }
+  opts.on("-t", "--threads=THREADS", "Specify the number of threads to use (default: 1)") { |t| options[:threads] = [t.to_i, 1].max }
+end
+
+begin
+  option_parser.parse!
+rescue OptionParser::ParseError
+  abort("Error: #{$!}\noption_parser")
+end
+
+src = ARGV.shift or abort(option_parser)
+dst = ARGV.shift or abort(option_parser)
+
+# set up the progress bar printer so we don't have evaluate tty each time
+if options[:progress] && options[:threads].to_i < 2 && $stdout.tty?
+  $stdout.sync = true
+  def tty_write(output)
+    $stdout.write(output)
+  end
+else
+  def tty_write(output)
+    0
+  end
+end
+
+# count the number of HTTP Connections we make
+module Rightscale
+  class HttpConnection
+    @@request_counter = 0
+    
+    def self.reset_counter
+      counter = @@request_counter
+      @@request_counter = 0
+      counter
+    end
+    
+    def request_with_counter(request_params, &block)
+      @@request_counter += 1
+      request_without_counter(request_params, &block)
+    end
+    alias_method :request_without_counter, :request
+    alias_method :request, :request_with_counter
+  end
+end
+
+# try to get the bucket object 
+def get_bucket_and_owner(s3, bucket_name)
+  bucket = s3.bucket(bucket_name) || S3::Bucket.new(s3, bucket_name)
+  owner = bucket.owner || S3::Owner.new(*s3.interface.get_acl_parse(bucket_name)[:owner].values_at(:id, :display_name))
+  return [bucket, owner]
+rescue
+  abort("Bucket #{bucket_name} is not accessible:\n#{$!}")
+end
+
+# main body
+def copy_keys(contents, me, src_bucket_name, src_prefix, dst_bucket_name, dst_prefix, options)
+  s3 = S3.new(nil, nil, :multi_thread => options[:threads] > 1, :port => options[:port], :protocol => options[:protocol], :logger => Logger.new(options[:log_file]))
+  src_bucket, src_owner = get_bucket_and_owner(s3, src_bucket_name)
+  dst_bucket, dst_owner = get_bucket_and_owner(s3, dst_bucket_name)
+
+  # the list does not include the acl, so we retrieve them manually
+  contents.each do |content|
+    content[:object] = S3::Key.create(src_bucket, content[:key])
+    content[:grantees] = content[:object].grantees
+    tty_write(Rightscale::HttpConnection.reset_counter)
+  end
+  tty_write("\n")
+  
+  # second pass makes the actual copy
+  contents.each do |content|
+    begin
+      src_key = content[:object]
+      dst_key = dst_bucket.key(content[:key].sub(/^#{src_prefix}/, dst_prefix))
+      
+      # only copy if it's not already the same
+      src_key.copy(dst_key) unless dst_key.e_tag && dst_key.e_tag == content[:e_tag]
+      
+      # make sure the destination bucket owner has full control over the the object
+      content[:grantees] << S3::Grantee.new(dst_key, dst_owner.id, 'FULL_CONTROL', :none)
+      S3::Grantee.put_acl(dst_key, me, content[:grantees])
+      
+      tty_write(Rightscale::HttpConnection.reset_counter)
+    rescue AwsError
+      contents << content
+      Rightscale::HttpConnection.reset_counter
+      tty_write('_')
+    end
+  end
+  tty_write("\n")
+end
+
+src_bucket_name, src_prefix = src.split(':', 2)
+dst_bucket_name, dst_prefix = dst.split(':', 2)
+
+# set up the S3 objects
+s3 = S3.new(nil, nil, :multi_thread => options[:threads] > 1, :port => options[:port], :protocol => options[:protocol], :logger => Logger.new(options[:log_file]))
+me = s3.buckets.first.owner
+threads = []
+
+# main loop through the source files; we make two passes so we don't go back and forth between source bucket and destination bucket
+s3.interface.incrementally_list_bucket(src_bucket_name, :prefix => src_prefix) do |response|
+  response[:contents].empty? || response[:contents].each_slice(response[:contents].size/options[:threads]) do |slice|
+    threads << Thread.new { copy_keys(slice, me, src_bucket_name, src_prefix, dst_bucket_name, dst_prefix, options) }
+  end
+  threads.each { |t| t.join }
+end
