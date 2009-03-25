@@ -146,7 +146,8 @@ threads = []
 
 # main loop through the source files; we make two passes so we don't go back and forth between source bucket and destination bucket
 s3.interface.incrementally_list_bucket(src_bucket_name, :prefix => src_prefix) do |response|
-  response[:contents].empty? || response[:contents].each_slice(response[:contents].size/options[:threads]) do |slice|
+  slice_size = [response[:contents].size/options[:threads], 1].max
+  response[:contents].each_slice(slice_size) do |slice|
     threads << Thread.new { copy_keys(slice, me, src_bucket_name, src_prefix, dst_bucket_name, dst_prefix, options) }
   end
   threads.each { |t| t.join }
