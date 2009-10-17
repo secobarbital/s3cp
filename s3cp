@@ -117,7 +117,7 @@ def copy_keys(contents, me, src_bucket_name, src_prefix, dst_bucket_name, dst_pr
   contents.each do |content|
     begin
       src_key = content[:object]
-      dst_key = dst_bucket.key(content[:key].sub(/^#{src_prefix}/, dst_prefix))
+      dst_key = dst_bucket.key(content[:key].sub(src_prefix, dst_prefix))
       
       # only copy if it's not already the same
       src_key.copy(dst_key) unless dst_key.e_tag && dst_key.e_tag == content[:e_tag]
@@ -146,8 +146,7 @@ threads = []
 
 # main loop through the source files; we make two passes so we don't go back and forth between source bucket and destination bucket
 s3.interface.incrementally_list_bucket(src_bucket_name, :prefix => src_prefix) do |response|
-  slice_size = [response[:contents].size/options[:threads], 1].max
-  response[:contents].each_slice(slice_size) do |slice|
+  response[:contents].empty? || response[:contents].each_slice([response[:contents].size/options[:threads], 1].max) do |slice|
     threads << Thread.new { copy_keys(slice, me, src_bucket_name, src_prefix, dst_bucket_name, dst_prefix, options) }
   end
   threads.each { |t| t.join }
